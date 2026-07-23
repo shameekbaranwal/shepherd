@@ -1,0 +1,216 @@
+import Foundation
+
+/// One agent pane, as the UI sees it.
+public struct HerdAgent: Sendable, Identifiable {
+    public var id: String { paneID }
+    public let paneID: String
+    public let workspaceID: String
+    public let tabID: String
+    public var workspaceLabel: String
+    public var tabLabel: String
+    public var agent: String
+    public var status: AgentStatus
+    public var cwd: String
+    /// When the current status began (best effort; snapshot rows keep prior value).
+    public var since: Date
+}
+
+public enum HerdUpdate: Sendable {
+    /// Full state (initial hydration and after any lifecycle change).
+    case hydrated([HerdAgent])
+    /// A single agent changed status.
+    case transition(agent: HerdAgent, from: AgentStatus)
+}
+
+/// Live model of the herd: hydrates from `session.snapshot`, then follows the
+/// push event stream. Lifecycle events (pane/tab/workspace created/closed/…)
+/// trigger a debounced re-hydration + resubscribe, since per-pane status
+/// subscriptions must track the current set of agent panes.
+public actor HerdBridge {
+    private let socketPath: String
+    private var eventConn: HerdrConnection?
+    private var eventTask: Task<Void, Never>?
+    private var rehydrateTask: Task<Void, Never>?
+    private var agents: [String: HerdAgent] = [:]
+    private var subscribedPanes: Set<String> = []
+    private var out: AsyncStream<HerdUpdate>.Continuation?
+
+    /// Events that mean "the shape of the herd may have changed".
+    /// (`pane_agent_detected` is handled separately — it fires as periodic
+    /// re-detection noise for every pane.)
+    private static let lifecycleEvents: Set<String> = [
+        "pane_created", "pane_closed", "pane_exited", "pane_moved",
+        "tab_created", "tab_closed", "tab_renamed",
+        "workspace_created", "workspace_closed", "workspace_renamed",
+    ]
+
+    public init(socketPath: String) {
+        self.socketPath = socketPath
+    }
+
+    /// Connect, hydrate, subscribe. Returns the update stream.
+    public func run() async throws -> AsyncStream<HerdUpdate> {
+        let (stream, cont) = AsyncStream<HerdUpdate>.makeStream()
+        out = cont
+        try await rehydrate()
+        return stream
+    }
+
+    public func shutdown() async {
+        eventTask?.cancel()
+        rehydrateTask?.cancel()
+        await eventConn?.close()
+        out?.finish()
+    }
+
+    /// herdr connections are one-shot: fresh connection per request.
+    private func oneShot<T: Decodable & Sendable>(_ method: String, params: JSON = .object([:]), as type: T.Type) async throws -> T {
+        let conn = HerdrConnection(socketPath: socketPath)
+        try await conn.connect()
+        defer { Task { await conn.close() } }
+        return try await conn.request(method, params: params, as: type)
+    }
+
+    // MARK: - hydration + subscription
+
+    private func rehydrate() async throws {
+        let snap = try await oneShot("session.snapshot", as: SnapshotResult.self).snapshot
+
+        let wsLabels = Dictionary(uniqueKeysWithValues: snap.workspaces.map { ($0.workspaceID, $0.label ?? $0.workspaceID) })
+        let tabLabels = Dictionary(uniqueKeysWithValues: snap.tabs.map { ($0.tabID, $0.label ?? $0.tabID) })
+
+        var next: [String: HerdAgent] = [:]
+        for info in snap.agents {
+            let previous = agents[info.paneID]
+            let since = (previous?.status == info.agentStatus) ? (previous?.since ?? Date()) : Date()
+            next[info.paneID] = HerdAgent(
+                paneID: info.paneID,
+                workspaceID: info.workspaceID,
+                tabID: info.tabID,
+                workspaceLabel: wsLabels[info.workspaceID] ?? info.workspaceID,
+                tabLabel: tabLabels[info.tabID] ?? info.tabID,
+                agent: info.agent ?? "agent",
+                status: info.agentStatus,
+                cwd: info.cwd ?? "",
+                since: since
+            )
+        }
+        agents = next
+        out?.yield(.hydrated(sortedAgents()))
+
+        let panes = Set(next.keys)
+        if panes != subscribedPanes || eventConn == nil {
+            try await resubscribe(panes: panes)
+        }
+    }
+
+    private func resubscribe(panes: Set<String>) async throws {
+        // Subscription types use a dot at the first separator only
+        // (e.g. "pane.agent_status_changed"); pushed events use underscores.
+        var subs: [JSON] = [
+            ["type": "pane.created"], ["type": "pane.closed"], ["type": "pane.exited"],
+            ["type": "pane.agent_detected"], ["type": "pane.moved"],
+            ["type": "tab.created"], ["type": "tab.closed"], ["type": "tab.renamed"],
+            ["type": "workspace.created"], ["type": "workspace.closed"], ["type": "workspace.renamed"],
+        ]
+        for pane in panes.sorted() {
+            subs.append(["type": "pane.agent_status_changed", "pane_id": .string(pane)])
+        }
+
+        let fresh = HerdrConnection(socketPath: socketPath)
+        try await fresh.connect()
+        let stream = try await fresh.subscribe(subs)
+
+        eventTask?.cancel()
+        await eventConn?.close()
+        eventConn = fresh
+        subscribedPanes = panes
+        eventTask = Task { [weak self] in
+            for await (event, data) in stream {
+                await self?.handle(event: event, data: data)
+            }
+            // Stream ended (server closed / connection lost): try to recover.
+            await self?.scheduleRehydrate()
+        }
+    }
+
+    // MARK: - event handling
+
+    private func debugLog(_ msg: String) {
+        if ProcessInfo.processInfo.environment["HERD_DEBUG"] != nil {
+            FileHandle.standardError.write(Data("[bridge] \(msg)\n".utf8))
+        }
+    }
+
+    private func handle(event: String, data: Data) {
+        debugLog("handle \(event)")
+        switch event {
+        // NOTE: unlike lifecycle events (underscores), this one is pushed
+        // with a DOT in the name — verified on the wire against herdr 0.7.x.
+        case "pane.agent_status_changed", "pane_agent_status_changed":
+            guard let env = try? JSONDecoder().decode(EventEnvelope<PaneAgentStatusChangedEvent>.self, from: data) else { return }
+            apply(env.data)
+        case "pane_agent_detected":
+            guard let env = try? JSONDecoder().decode(EventEnvelope<PaneAgentDetectedEvent>.self, from: data) else { return }
+            let d = env.data
+            // Rehydrate only when this changes the herd's shape: an agent on a
+            // pane we don't track yet, or an agent released from a pane we do.
+            if d.released == true && agents[d.paneID] != nil {
+                scheduleRehydrate()
+            } else if d.agent != nil && agents[d.paneID] == nil {
+                scheduleRehydrate()
+            }
+        default:
+            if Self.lifecycleEvents.contains(event) {
+                scheduleRehydrate()
+            }
+        }
+    }
+
+    private func apply(_ e: PaneAgentStatusChangedEvent) {
+        guard var a = agents[e.paneID] else {
+            scheduleRehydrate()
+            return
+        }
+        guard a.status != e.agentStatus else { return }
+        let old = a.status
+        a.status = e.agentStatus
+        a.since = Date()
+        if let name = e.agent { a.agent = name }
+        agents[e.paneID] = a
+        out?.yield(.transition(agent: a, from: old))
+    }
+
+    /// Coalescing, leading-edge debounce: lifecycle events arrive in bursts
+    /// (splits, workspace churn, and the server's event REPLAY on subscribe).
+    /// A trailing-edge debounce starves under continuous noise — instead,
+    /// later triggers coalesce into the already-scheduled rehydrate.
+    /// Note: replay → rehydrate cannot loop, because resubscribe (and hence a
+    /// fresh replay) only happens when the agent-pane set actually changed.
+    private func scheduleRehydrate() {
+        guard rehydrateTask == nil else { return }
+        rehydrateTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            await self?.runScheduledRehydrate()
+        }
+    }
+
+    private func runScheduledRehydrate() async {
+        rehydrateTask = nil
+        do {
+            try await rehydrate()
+        } catch {
+            debugLog("rehydrate FAILED: \(error)")
+        }
+    }
+
+    private func sortedAgents() -> [HerdAgent] {
+        let rank: [AgentStatus: Int] = [.blocked: 0, .done: 1, .working: 2, .idle: 3, .unknown: 4]
+        return agents.values.sorted {
+            let l = rank[$0.status, default: 5], r = rank[$1.status, default: 5]
+            if l != r { return l < r }
+            if $0.workspaceLabel != $1.workspaceLabel { return $0.workspaceLabel < $1.workspaceLabel }
+            return $0.paneID < $1.paneID
+        }
+    }
+}
