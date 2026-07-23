@@ -64,13 +64,17 @@ func draw(agents: [HerdAgent], transitions: [String]) {
         }
         .joined(separator: " · ")
     out += "\(ANSI.bold) \(weather(agents))  herd\(ANSI.reset)  \(summary)\n\n"
-    out += "\(ANSI.bold) \(pad("st", 3))\(pad("workspace", 22))\(pad("tab", 22))\(pad("agent", 8))\(pad("status", 9))\(pad("for", 8))cwd\(ANSI.reset)\n"
+    out += "\(ANSI.bold) \(pad("st", 3))\(pad("workspace", 22))\(pad("tab", 22))\(pad("agent", 8))\(pad("status", 11))\(pad("for", 8))cwd\(ANSI.reset)\n"
     for a in agents {
         let c = ANSI.color(a.status)
         let cwdTail = a.cwd.split(separator: "/").suffix(2).joined(separator: "/")
-        out += " \(c)\(pad(ANSI.glyph(a.status), 3))\(ANSI.reset)"
+        // Completion latch: finished + unacknowledged shows a green ✔ even
+        // though herdr has already collapsed done → idle.
+        let glyph = a.needsAck ? "\u{1B}[32m✔\(ANSI.reset)" + String(repeating: " ", count: 2) : "\(c)\(pad(ANSI.glyph(a.status), 3))\(ANSI.reset)"
+        let statusText = a.needsAck && a.status != .done ? "\(a.status.rawValue) ✔" : a.status.rawValue
+        out += " \(glyph)"
         out += "\(pad(a.workspaceLabel, 22))\(pad(a.tabLabel, 22))\(pad(a.agent, 8))"
-        out += "\(c)\(pad(a.status.rawValue, 9))\(ANSI.reset)\(pad(elapsed(since: a.since), 8))\(ANSI.dim)\(cwdTail)\(ANSI.reset)\n"
+        out += "\(c)\(pad(statusText, 11))\(ANSI.reset)\(pad(elapsed(since: a.since), 8))\(ANSI.dim)\(cwdTail)\(ANSI.reset)\n"
     }
     if !transitions.isEmpty {
         out += "\n\(ANSI.bold) transitions\(ANSI.reset)\n"
@@ -119,10 +123,9 @@ do {
             transitions.append(
                 "\(ANSI.dim)\(timestamp())\(ANSI.reset) \(agent.workspaceLabel)/\(agent.tabLabel) [\(agent.agent)] \(from.rawValue) → \(c)\(agent.status.rawValue)\(ANSI.reset)"
             )
-            // Re-sort: attention order (blocked first).
-            let rank: [AgentStatus: Int] = [.blocked: 0, .done: 1, .working: 2, .idle: 3, .unknown: 4]
+            // Re-sort: attention order (blocked first, then finished-unacked).
             table.sort {
-                let l = rank[$0.status, default: 5], r = rank[$1.status, default: 5]
+                let l = HerdBridge.attentionRank($0), r = HerdBridge.attentionRank($1)
                 if l != r { return l < r }
                 if $0.workspaceLabel != $1.workspaceLabel { return $0.workspaceLabel < $1.workspaceLabel }
                 return $0.paneID < $1.paneID

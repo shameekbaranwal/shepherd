@@ -13,6 +13,16 @@ public struct HerdAgent: Sendable, Identifiable {
     public var cwd: String
     /// When the current status began (best effort; snapshot rows keep prior value).
     public var since: Date
+    /// Completion latch. herdr's `done` is EPHEMERAL (focusing the pane
+    /// collapses it to `idle`), and for heuristic agents like Claude Code the
+    /// practical completion signal is the `working → idle` edge. So the bridge
+    /// latches completion as its own derived fact: set on `working → idle/done`
+    /// (and `blocked → done`), survives herdr's done→idle collapse, cleared
+    /// when the agent starts working again or via `ack(paneID:)`.
+    public var finishedAt: Date?
+
+    /// Finished and not yet acknowledged — what the attention queue keys on.
+    public var needsAck: Bool { finishedAt != nil }
 }
 
 public enum HerdUpdate: Sendable {
@@ -83,6 +93,16 @@ public actor HerdBridge {
         for info in snap.agents {
             let previous = agents[info.paneID]
             let since = (previous?.status == info.agentStatus) ? (previous?.since ?? Date()) : Date()
+            // Snapshot is TOPOLOGY truth (which agents exist, labels, cwd).
+            // The completion latch is ours: carry it across rehydrates, and if
+            // the working→idle/done edge happened while we weren't looking
+            // (connection swap), latch it here too.
+            var finishedAt = previous?.finishedAt
+            if let previous, previous.status == .working,
+               info.agentStatus == .idle || info.agentStatus == .done {
+                finishedAt = Date()
+            }
+            if info.agentStatus == .working { finishedAt = nil }
             next[info.paneID] = HerdAgent(
                 paneID: info.paneID,
                 workspaceID: info.workspaceID,
@@ -92,7 +112,8 @@ public actor HerdBridge {
                 agent: info.agent ?? "agent",
                 status: info.agentStatus,
                 cwd: info.cwd ?? "",
-                since: since
+                since: since,
+                finishedAt: finishedAt
             )
         }
         agents = next
@@ -177,8 +198,26 @@ public actor HerdBridge {
         a.status = e.agentStatus
         a.since = Date()
         if let name = e.agent { a.agent = name }
+        // Completion latch (see HerdAgent.finishedAt). Idempotent under the
+        // server's event replay: re-applying the same edge is a no-op above.
+        switch (old, e.agentStatus) {
+        case (.working, .idle), (.working, .done), (.blocked, .done):
+            a.finishedAt = Date()
+        case (_, .working):
+            a.finishedAt = nil
+        default:
+            break
+        }
         agents[e.paneID] = a
         out?.yield(.transition(agent: a, from: old))
+    }
+
+    /// Acknowledge a finished agent: clears the completion latch.
+    public func ack(paneID: String) {
+        guard var a = agents[paneID], a.finishedAt != nil else { return }
+        a.finishedAt = nil
+        agents[paneID] = a
+        out?.yield(.hydrated(sortedAgents()))
     }
 
     /// Coalescing, leading-edge debounce: lifecycle events arrive in bursts
@@ -204,10 +243,20 @@ public actor HerdBridge {
         }
     }
 
+    /// Attention rank: blocked → finished-unacked → working → idle → unknown.
+    public static func attentionRank(_ a: HerdAgent) -> Int {
+        if a.status == .blocked { return 0 }
+        if a.needsAck || a.status == .done { return 1 }
+        switch a.status {
+        case .working: return 2
+        case .idle: return 3
+        default: return 4
+        }
+    }
+
     private func sortedAgents() -> [HerdAgent] {
-        let rank: [AgentStatus: Int] = [.blocked: 0, .done: 1, .working: 2, .idle: 3, .unknown: 4]
-        return agents.values.sorted {
-            let l = rank[$0.status, default: 5], r = rank[$1.status, default: 5]
+        agents.values.sorted {
+            let l = Self.attentionRank($0), r = Self.attentionRank($1)
             if l != r { return l < r }
             if $0.workspaceLabel != $1.workspaceLabel { return $0.workspaceLabel < $1.workspaceLabel }
             return $0.paneID < $1.paneID
