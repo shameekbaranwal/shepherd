@@ -212,6 +212,12 @@ public actor HerdBridge {
         out?.yield(.transition(agent: a, from: old))
     }
 
+    /// Focus an agent's pane in the terminal (workspace/tab/pane jump).
+    public func focus(paneID: String) async {
+        struct AnyResult: Decodable, Sendable { let type: String? }
+        _ = try? await oneShot("agent.focus", params: ["target": .string(paneID)], as: AnyResult.self)
+    }
+
     /// Acknowledge a finished agent: clears the completion latch.
     public func ack(paneID: String) {
         guard var a = agents[paneID], a.finishedAt != nil else { return }
