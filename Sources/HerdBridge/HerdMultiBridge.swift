@@ -120,6 +120,17 @@ public enum HerdSessionDiscovery {
         public let suggestedLabel: String
         public let socketPath: String
         public let alive: Bool
+        /// Set for remote HINTS: a herdr --remote attach proxy was seen for
+        /// this ssh target. The proxy itself is not an API socket — add the
+        /// remote as an SSH-forwarded reef instead.
+        public let sshTarget: String?
+
+        public init(suggestedLabel: String, socketPath: String, alive: Bool, sshTarget: String? = nil) {
+            self.suggestedLabel = suggestedLabel
+            self.socketPath = socketPath
+            self.alive = alive
+            self.sshTarget = sshTarget
+        }
     }
 
     /// Known socket locations: the default session, named local sessions,
@@ -139,11 +150,29 @@ public enum HerdSessionDiscovery {
                 found.append(Found(suggestedLabel: name, socketPath: sock, alive: probe(sock)))
             }
         }
-        // NOTE: herdr's --remote attach proxies ($TMPDIR/herdr-remote-*.sock)
-        // are deliberately NOT offered: verified empirically that they accept
-        // connections but never answer API requests (attach transport, not an
-        // API proxy). Remote herds need an SSH unix-socket forward to the
-        // remote server's real socket instead.
+        // Remote attach proxies ($TMPDIR/herdr-remote-<pid>-<target>-<session>
+        // .sock) are NOT API sockets (verified: they accept connections but
+        // never answer). We surface them as HINTS — evidence that a remote
+        // herd exists — so UIs can offer an SSH-forwarded reef for the target.
+        let tmp = NSTemporaryDirectory()
+        var seenRemotes = Set<String>()
+        for name in ((try? fm.contentsOfDirectory(atPath: tmp)) ?? []).sorted() {
+            guard name.hasPrefix("herdr-remote-"), name.hasSuffix(".sock") else { continue }
+            let core = name.dropFirst("herdr-remote-".count).dropLast(".sock".count)
+            let parts = core.split(separator: "-")
+            guard parts.count >= 3 else { continue }
+            let target = parts.dropFirst().dropLast().joined(separator: "-")
+            let session = String(parts.last ?? "default")
+            let key = "\(target)/\(session)"
+            guard !seenRemotes.contains(key), !target.isEmpty else { continue }
+            seenRemotes.insert(key)
+            found.append(Found(
+                suggestedLabel: session == "default" ? target : "\(target)-\(session)",
+                socketPath: tmp + name,
+                alive: probe(tmp + name),
+                sshTarget: target
+            ))
+        }
         return found
     }
 
