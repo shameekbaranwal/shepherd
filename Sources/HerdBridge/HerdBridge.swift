@@ -2,7 +2,8 @@ import Foundation
 
 /// One agent pane, as the UI sees it.
 public struct HerdAgent: Sendable, Identifiable {
-    public var id: String { paneID }
+    /// Session-qualified: pane ids repeat across herdr sessions.
+    public var id: String { "\(machine)/\(paneID)" }
     public let paneID: String
     public let workspaceID: String
     public let tabID: String
@@ -41,6 +42,8 @@ public enum HerdUpdate: Sendable {
 /// subscriptions must track the current set of agent panes.
 public actor HerdBridge {
     private let socketPath: String
+    /// Reef/session label stamped onto every agent (HerdAgent.machine).
+    private let label: String
     private var eventConn: HerdrConnection?
     private var eventTask: Task<Void, Never>?
     private var rehydrateTask: Task<Void, Never>?
@@ -57,8 +60,9 @@ public actor HerdBridge {
         "workspace_created", "workspace_closed", "workspace_renamed",
     ]
 
-    public init(socketPath: String) {
+    public init(socketPath: String, label: String = "local") {
         self.socketPath = socketPath
+        self.label = label
     }
 
     /// Connect, hydrate, subscribe. Returns the update stream.
@@ -113,7 +117,7 @@ public actor HerdBridge {
                 workspaceLabel: wsLabels[info.workspaceID] ?? info.workspaceID,
                 tabLabel: tabLabels[info.tabID] ?? info.tabID,
                 agent: info.agent ?? "agent",
-                machine: "local",
+                machine: label,
                 status: info.agentStatus,
                 cwd: info.cwd ?? "",
                 since: since,
@@ -264,12 +268,17 @@ public actor HerdBridge {
         }
     }
 
+    /// Attention rank, then recency — the agent that changed state last
+    /// (finished/started most recently) floats to the top of its group.
+    public static func attentionSort(_ a: HerdAgent, _ b: HerdAgent) -> Bool {
+        let l = attentionRank(a), r = attentionRank(b)
+        if l != r { return l < r }
+        let la = a.finishedAt ?? a.since, rb = b.finishedAt ?? b.since
+        if la != rb { return la > rb }
+        return a.id < b.id
+    }
+
     private func sortedAgents() -> [HerdAgent] {
-        agents.values.sorted {
-            let l = Self.attentionRank($0), r = Self.attentionRank($1)
-            if l != r { return l < r }
-            if $0.workspaceLabel != $1.workspaceLabel { return $0.workspaceLabel < $1.workspaceLabel }
-            return $0.paneID < $1.paneID
-        }
+        agents.values.sorted(by: Self.attentionSort)
     }
 }
