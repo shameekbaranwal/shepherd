@@ -18,6 +18,10 @@ public actor HerdMultiBridge {
     private var tasks: [String: Task<Void, Never>] = [:]
     private var agents: [String: HerdAgent] = [:]   // keyed by HerdAgent.id
     private var out: AsyncStream<HerdUpdate>.Continuation?
+    private var statusByLabel: [String: String] = [:]
+
+    /// Human-readable per-session connection status (for settings UIs).
+    public func statuses() -> [String: String] { statusByLabel }
 
     public init() {}
 
@@ -40,6 +44,7 @@ public actor HerdMultiBridge {
             Task { await bridge?.shutdown() }
             bridges[label] = nil
             agents = agents.filter { $0.value.machine != label }
+            statusByLabel[label] = nil
         }
         // add new
         for (label, session) in want where bridges[label] == nil {
@@ -56,13 +61,15 @@ public actor HerdMultiBridge {
     /// (remote proxy gone) empties its reef and keeps retrying quietly.
     private func consume(bridge: HerdBridge, label: String) async {
         while !Task.isCancelled {
+            statusByLabel[label] = "connecting…"
             do {
                 let stream = try await bridge.run()
                 for await update in stream {
                     apply(update, label: label)
                 }
+                statusByLabel[label] = "stream ended — retrying"
             } catch {
-                // connect failed — clear this reef and retry
+                statusByLabel[label] = "error: \((error as? HerdrError)?.description ?? String(describing: error))"
             }
             agents = agents.filter { $0.value.machine != label }
             emitHydrated()
@@ -75,6 +82,7 @@ public actor HerdMultiBridge {
         case .hydrated(let list):
             agents = agents.filter { $0.value.machine != label }
             for a in list { agents[a.id] = a }
+            statusByLabel[label] = "connected · \(list.count) agent\(list.count == 1 ? "" : "s")"
             emitHydrated()
         case .transition(let agent, let from):
             agents[agent.id] = agent
@@ -131,17 +139,11 @@ public enum HerdSessionDiscovery {
                 found.append(Found(suggestedLabel: name, socketPath: sock, alive: probe(sock)))
             }
         }
-        let tmp = NSTemporaryDirectory()
-        for name in (try? fm.contentsOfDirectory(atPath: tmp)) ?? [] {
-            guard name.hasPrefix("herdr-remote-"), name.hasSuffix(".sock") else { continue }
-            let sock = tmp + name
-            // herdr-remote-<pid>-<target>-<session>.sock → "<target>-<session>"
-            let core = name.dropFirst("herdr-remote-".count).dropLast(".sock".count)
-            let label = core.split(separator: "-").dropFirst().joined(separator: "-")
-            let alive = probe(sock)
-            guard alive else { continue }   // stale proxies from dead attaches are noise
-            found.append(Found(suggestedLabel: label.isEmpty ? String(core) : label, socketPath: sock, alive: alive))
-        }
+        // NOTE: herdr's --remote attach proxies ($TMPDIR/herdr-remote-*.sock)
+        // are deliberately NOT offered: verified empirically that they accept
+        // connections but never answer API requests (attach transport, not an
+        // API proxy). Remote herds need an SSH unix-socket forward to the
+        // remote server's real socket instead.
         return found
     }
 

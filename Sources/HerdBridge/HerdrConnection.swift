@@ -122,6 +122,12 @@ public actor HerdrConnection {
                     Task { await self?.fail(id: id, error: error) }
                 }
             })
+            // A socket that connects but never answers (e.g. herdr's --remote
+            // attach proxy) must not hang the bridge forever.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                await self?.fail(id: id, error: HerdrError(code: "timeout", message: "no reply in 8s — not an API socket?"))
+            }
         }
     }
 
