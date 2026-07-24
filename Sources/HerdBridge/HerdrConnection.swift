@@ -64,6 +64,15 @@ public actor HerdrConnection {
                 }
             }
             c.start(queue: .global())
+            // NWConnection never fails on a missing unix socket path — it
+            // waits forever. Bound the connect explicitly.
+            Task {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                once.run {
+                    c.cancel()
+                    k.resume(throwing: HerdrError(code: "connect_timeout", message: "socket not reachable (5s)"))
+                }
+            }
         }
         // Post-ready: route later failures into teardown.
         c.stateUpdateHandler = { [weak self] state in
