@@ -9,6 +9,9 @@ public struct HerdAgent: Sendable, Identifiable {
     public var workspaceLabel: String
     public var tabLabel: String
     public var agent: String
+    /// Which machine this agent runs on ("local" for the default socket;
+    /// remote herds get their host label when multi-socket lands).
+    public var machine: String
     public var status: AgentStatus
     public var cwd: String
     /// When the current status began (best effort; snapshot rows keep prior value).
@@ -110,6 +113,7 @@ public actor HerdBridge {
                 workspaceLabel: wsLabels[info.workspaceID] ?? info.workspaceID,
                 tabLabel: tabLabels[info.tabID] ?? info.tabID,
                 agent: info.agent ?? "agent",
+                machine: "local",
                 status: info.agentStatus,
                 cwd: info.cwd ?? "",
                 since: since,
