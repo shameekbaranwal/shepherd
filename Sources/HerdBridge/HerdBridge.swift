@@ -47,9 +47,13 @@ public actor HerdBridge {
     private var eventConn: HerdrConnection?
     private var eventTask: Task<Void, Never>?
     private var rehydrateTask: Task<Void, Never>?
+    private var safetyTask: Task<Void, Never>?
     private var agents: [String: HerdAgent] = [:]
     private var subscribedPanes: Set<String> = []
     private var out: AsyncStream<HerdUpdate>.Continuation?
+
+    /// How often the safety reconcile polls the snapshot as an event backstop.
+    private static let safetyInterval: UInt64 = 20_000_000_000   // 20s
 
     /// Events that mean "the shape of the herd may have changed".
     /// (`pane_agent_detected` is handled separately — it fires as periodic
@@ -70,14 +74,45 @@ public actor HerdBridge {
         let (stream, cont) = AsyncStream<HerdUpdate>.makeStream()
         out = cont
         try await rehydrate()
+        startSafetyLoop()
         return stream
     }
 
     public func shutdown() async {
         eventTask?.cancel()
         rehydrateTask?.cancel()
+        safetyTask?.cancel()
         await eventConn?.close()
         out?.finish()
+    }
+
+    /// Event backstop: even with the lifecycle subscriptions, a herd can drift
+    /// if herdr never emits (or we miss) a create/status event — the agent then
+    /// stays invisible until the next manual reconnect. This loop periodically
+    /// re-snapshots and, ONLY when the pane set or a status actually diverges
+    /// from what we hold, schedules a (debounced, coalescing) rehydrate. A
+    /// clean herd costs one cheap snapshot read per interval and yields nothing.
+    private func startSafetyLoop() {
+        safetyTask?.cancel()
+        safetyTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.safetyInterval)
+                if Task.isCancelled { return }
+                await self?.reconcile()
+            }
+        }
+    }
+
+    private func reconcile() async {
+        guard let snap = try? await oneShot("session.snapshot", as: SnapshotResult.self).snapshot else { return }
+        let snapPanes = Set(snap.agents.map(\.paneID))
+        let curPanes = Set(agents.keys)
+        // topology drift (pane added/removed), or a status a missed event left stale
+        let statusDrift = snap.agents.contains { agents[$0.paneID]?.status != $0.agentStatus }
+        if snapPanes != curPanes || statusDrift {
+            debugLog("safety reconcile: drift detected (panes \(curPanes.count)→\(snapPanes.count)), rehydrating")
+            scheduleRehydrate()
+        }
     }
 
     /// herdr connections are one-shot: fresh connection per request.
